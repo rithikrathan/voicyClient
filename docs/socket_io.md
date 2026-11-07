@@ -123,14 +123,11 @@ Located in `$XDG_RUNTIME_DIR` (`/run/user/1000/` by default).
 {"type": "RECORD_STOP"}
 {"type": "RECORD_CANCEL"}
 
-// Direct Keystroke Injections (Target: "%18" or "focused")
-{"type": "KEY_PRESS", "key": "Enter" | "Escape" | "Ctrl+C" | "Alt+M", "target": "%18"}
+// Direct Keystroke Injections (routed automatically by daemon)
+{"type": "KEY_PRESS", "key": "Enter" | "Escape" | "Ctrl+C" | "Alt+M"}
 
 // Direct Text Injection (Used in Mode 3 when phone computes STT)
-{"type": "DELIVER_TEXT", "text": "transcribed text from phone", "target": "%18"}
-
-// Target Switching
-{"type": "SET_TARGET", "target": "%18" | "none"}
+{"type": "DELIVER_TEXT", "text": "transcribed text from phone"}
 
 // Text-to-Speech Requests
 {"type": "TTS_SPEAK", "text": "Hello world", "voice": "Alba", "volume": 1.0}
@@ -143,9 +140,8 @@ Located in `$XDG_RUNTIME_DIR` (`/run/user/1000/` by default).
 ```json
 // Status Synchronizations
 {"type": "STATUS_UPDATE", "state": "idle" | "recording" | "transcribing" | "typing" | "speaking"}
-{"type": "TARGET_UPDATE", "target": "%18"}
 {"type": "PARTIAL_TEXT", "text": "in-flight recognition..."}
-{"type": "COMMITTED_TEXT", "text": "delivered sentence.", "target": "%18"}
+{"type": "COMMITTED_TEXT", "text": "delivered sentence."}
 {"type": "ERROR", "message": "error description"}
 ```
 

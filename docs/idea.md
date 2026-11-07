@@ -11,7 +11,7 @@ High-density technical specification for multi-device voice dictation, speech sy
 - **Audio Output**: Daemon host system speakers.
 - **Compute**: Voicy Daemon host processes raw audio via speech-to-text model.
 - **Transport**: 16kHz mono 16-bit PCM chunks streamed over WebSocket (`0x02` binary frames).
-- **Execution Target**: Text injected directly into locked tmux pane (`%18`) or active Wayland window via `wtype`.
+- **Execution Target**: Text injected directly into locked tmux pane or active Wayland window via `wtype` by daemon.
 - **Resource Footprint**: Minimal mobile CPU and battery footprint; best for light phone overhead while dictating around the room.
 
 ### Mode 2: Full Phone I/O (Daemon Compute, Phone Audio)
@@ -21,14 +21,14 @@ High-density technical specification for multi-device voice dictation, speech sy
 - **Transport**: 
   - Upstream: Phone streams mic PCM audio to Daemon over WebSocket (`0x02` binary frames).
   - Downstream: Daemon streams synthesized TTS PCM audio back to Phone over WebSocket (`0x01` binary frames).
-- **Execution Target**: Daemon types text to `%18` and returns synthesized voice directly to user's pocket/ears.
+- **Execution Target**: Daemon types text to active target and returns synthesized voice directly to user's pocket/ears.
 
 ### Mode 3: Full Phone I/O (Phone Compute, Autonomous Audio)
 - **Audio Capture**: Android device microphone.
 - **Audio Output**: Android device speaker / Bluetooth headset.
 - **Compute**: Android device executes on-device Sherpa-ONNX STT and Phonon TTS models locally in background.
 - **Transport**: Pure text JSON packets exchanged over WebSocket (`DELIVER_TEXT` to Daemon, `TTS_PROMPT` to Phone).
-- **Execution Target**: Voicy Daemon receives finalized text and types it into `%18`. Zero audio bandwidth across Wi-Fi.
+- **Execution Target**: Voicy Daemon receives finalized text and types it into active target. Zero audio bandwidth across Wi-Fi.
 
 ### Mode 4: Wireless API Mode (Phone Compute Engine)
 - **Compute Role**: Android device functions as an autonomous remote compute engine for the Voicy Daemon.
@@ -54,7 +54,7 @@ High-density technical specification for multi-device voice dictation, speech sy
 
 1. **UDP Broadcast Auto-Discovery (Port 9098)**:
    - Mobile sends `{"cmd": "VOICY_DISCOVER"}` to `255.255.255.255:9098`.
-   - Daemon replies with unicast JSON: `{"cmd": "VOICY_BEACON", "port": 9099, "hostname": "<name>", "target": "%18"}`.
+   - Daemon replies with unicast JSON: `{"cmd": "VOICY_BEACON", "port": 9099, "hostname": "<name>"}`.
    - Client automatically initiates WebSocket handshake.
 2. **Manual Override**:
    - Permanent IP:Port input in UI settings for subnets or routers blocking UDP broadcasts.

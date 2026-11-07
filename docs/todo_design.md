@@ -43,7 +43,7 @@ High-density technical architecture, code design patterns, and engineering ratio
 ---
 
 ## 3. [P0] Remote Keypress Dispatch (`Enter`, `Escape`, `Ctrl+C`, `Alt+M`)
-- **What it does**: Dispatches virtual keystrokes received over WebSocket directly into the active tmux pane (`%18`) or Wayland desktop via `wtype`.
+- **What it does**: Dispatches virtual keystrokes received over WebSocket directly using the daemon's active target (tmux pane or Wayland window via `wtype`).
 - **Design in Code**:
   ```rust
   pub fn send_remote_key(key: &str, target: Option<&str>) {

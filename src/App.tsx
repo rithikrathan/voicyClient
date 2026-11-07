@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import {
   Mic,
   MicOff,
@@ -24,7 +24,7 @@ export default function App() {
   const [autoDiscover, setAutoDiscover] = useState(true);
   const [isDiscovering, setIsDiscovering] = useState(false);
   const [daemonHost, setDaemonHost] = useState('192.168.1.100:9099');
-  const [discoveredHost, setDiscoveredHost] = useState('10.67.0.31:9099 (xps)');
+  const [discoveredHost] = useState('10.67.0.31:9099 (xps)');
   const [activeVoice, setActiveVoice] = useState('Alba');
   const [volume, setVolume] = useState(100);
   const [executionMode, setExecutionMode] = useState<'wireless_mic' | 'phone_compute' | 'reverse_compute'>('wireless_mic');
@@ -43,7 +43,7 @@ export default function App() {
     if (isRecording) {
       setIsRecording(false);
       setStatus('transcribing');
-      setLastAction('Delivering transcription to %18');
+      setLastAction('Delivering transcription...');
       setTimeout(() => {
         setStatus('idle');
       }, 1000);
@@ -80,7 +80,7 @@ export default function App() {
     }
   }, [isRecording]);
 
-  const sendRemoteKey = (key: string, label: string) => {
+  const sendRemoteKey = (_key: string, label: string) => {
     setLastAction(`Executed: ${label}`);
   };
 
@@ -124,12 +124,10 @@ export default function App() {
       {/* Main Screen Body */}
       {!showSettings ? (
         <main className="flex-1 flex flex-col items-center justify-between px-6 relative overflow-hidden">
-          {/* Subtle Target Daemon Pane Status */}
+          {/* Daemon Status */}
           <div className="mt-4 flex items-center gap-2 px-3 py-1 rounded-full bg-red-950/20 border border-red-900/20 text-[11px] font-mono text-red-400/80">
             <Radio size={11} className={isRecording ? 'text-red-500 animate-pulse' : 'text-zinc-600'} />
-            <span>Target: <strong>tmux %18</strong></span>
-            <span className="text-zinc-800">|</span>
-            <span className="uppercase text-[10px] tracking-widest text-zinc-500">{status}</span>
+            <span className="uppercase text-[10px] tracking-widest text-zinc-400">{status}</span>
           </div>
 
           {/* Central Radial Stage shifted slightly upward */}
