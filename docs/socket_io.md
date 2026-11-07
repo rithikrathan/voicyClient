@@ -12,9 +12,9 @@ The Voicy daemon exposes two complementary layers of communication:
 +-----------------------------------------------------------------------------------------+
 |                                    VOICY DAEMON                                         |
 |                                                                                         |
-|  [Unix Domain Sockets (Local IPC)]           [Network Sockets (Remote Multi-Device)]    |
-|   - Control: /run/user/1000/voicy.sock         - Discovery: UDP 0.0.0.0:9098            |
-|   - Events:  /run/user/1000/voicy-events.sock  - Realtime:  WebSocket 0.0.0.0:9099      |
+|  [Unix Domain Sockets (Local IPC)]           [Network Socket (Remote Mobile Client)]     |
+|   - Control: /run/user/1000/voicy.sock         - Realtime: WebSocket 0.0.0.0:9099       |
+|   - Events:  /run/user/1000/voicy-events.sock    (Configured via manual IP/port in UI)  |
 +-----------------------------------------------------------------------------------------+
 ```
 
@@ -22,7 +22,7 @@ The Voicy daemon exposes two complementary layers of communication:
 
 ## 2. Unix Domain Sockets (Local IPC)
 
-Located in `$XDG_RUNTIME_DIR` (`/run/user/1000/` by default).
+Located in `$XDG_RUNTIME_DIR` (`/run/user/1000/` or `/run/user/0/` in root containers).
 
 ### A. Control Socket (`/run/user/1000/voicy.sock`)
 - **Protocol**: Text-based line-delimited request-response (`\n`).
@@ -33,15 +33,20 @@ Located in `$XDG_RUNTIME_DIR` (`/run/user/1000/` by default).
 
 | Command | Arguments / Payload | Daemon Response | Description |
 | :--- | :--- | :--- | :--- |
-| `START` | None (or `:DICTATE`) | `recording\n` or `already_recording\n` or `error: <msg>\n` | Pauses media players via MPRIS, plays start chime, begins audio recording and VAD chunking. |
+| `START` | None (or `:DICTATE`) | `recording\n` or `already_recording\n` or `error: <msg>\n` | Pauses media players, plays start chime, begins audio recording and VAD chunking. |
 | `STOP` | None | `queued\n` or `idle\n` | Stops audio capture, resumes media players, and queues commit task to transcribe & deliver text. |
 | `TOGGLE` | None (or `:DICTATE`) | `recording\n` or `queued\n` or `error: <msg>\n` | Toggles state between `START` and `STOP`. |
 | `CANCEL` | None | `canceled_recording\n` or `canceled_transcription\n` or `idle\n` | Drops active recording immediately with zero transcription. If transcribing, suppresses output typing. |
 | `STATUS` | None | `idle\n` \| `recording\n` \| `transcribing\n` \| `typing\n` \| `speaking\n` | Queries instantaneous internal daemon state. |
 | `TARGET` | `TARGET` (query) or `TARGET:<pane_id>` or `TARGET:none` | `Target: <id>\n` or `Active target set to: '<id>'\n` or `Target cleared...\n` | Gets or sets target window/pane. If `%<num>`, delivers via `tmux send-keys`. If `none`, types into focused window. |
-| `SPEAK:<json>` | JSON payload: `{"text": "...", "voice": "...", "volume": 1.0}` or plain text string | `ok\n` or `error: <msg>\n` | Enqueues text to local Phonon TTS engine with lookahead background synthesis. |
+| `SPEAK:<text>` | Text string or JSON payload | `ok\n` or `error: <msg>\n` | Enqueues text to local Phonon TTS engine with lookahead background synthesis. |
 | `STOP_TTS` | None | `ok\n` | Stops active TTS playback immediately without clearing subsequent queued speech jobs. |
 | `TTS_CLEAR_AND_STOP` | None | `ok\n` | Halts active playback AND flushes all pending speech jobs from lookahead queue. Resumes media players. |
+| `CLIENT:ON` | None | `client_enabled\n` | Turns on client remote processing; accepts WebSocket incoming input from mobile client. |
+| `CLIENT:OFF` | None | `client_disabled\n` | Turns off client remote processing; ignores or disconnects mobile client inputs. |
+| `CLIENT:STATUS` | None | `{"enabled": true, "connected": true, "mode": "remote"}\n` | Returns current mobile client connection state, toggle status, and active operational mode. |
+| `MODE:COMPUTE` | None | `mode_set:compute\n` | Instructs daemon to set client mode to Compute Mode (phone executes models). |
+| `MODE:REMOTE` | None | `mode_set:remote\n` | Instructs daemon to set client mode to Remote Mode (phone acts as remote I/O). |
 
 ---
 
@@ -79,79 +84,125 @@ Located in `$XDG_RUNTIME_DIR` (`/run/user/1000/` by default).
 }
 ```
 
----
-
-## 3. Network Sockets (Remote Android & Multi-Device)
-
-### A. UDP Auto-Discovery Beacon (Port 9098)
-- **Transport**: UDP broadcast on LAN (`0.0.0.0:9098`).
-
-#### Discovery Flow:
-1. **Client Broadcast Query**:
+4. **Client State Event**:
 ```json
 {
-  "cmd": "VOICY_DISCOVER",
-  "client": "voicy-mobile-tauri",
-  "version": "1.0"
-}
-```
-2. **Daemon Unicast Response**:
-```json
-{
-  "cmd": "VOICY_BEACON",
-  "hostname": "xps-linux",
-  "ws_port": 9099,
-  "active_target": "%18",
-  "tts_enabled": true,
-  "auth_required": false
+  "type": "client",
+  "data": {
+    "enabled": true,
+    "mode": "remote" | "compute",
+    "connected": true
+  }
 }
 ```
 
 ---
 
-### B. WebSocket Control & Audio Bridge (Port 9099)
-- **Transport**: Bidirectional WebSocket (`ws://<daemon_ip>:9099/ws`).
+## 3. Network Socket: WebSocket Bridge (Port 9099)
+
+- **Transport**: Bidirectional WebSocket (`ws://<daemon_host>:<port>/ws`).
+- **Connection Address**: Configured by user in client Settings screen (manual IP and port, default `9099`).
 - **Framing**:
   - **Text Frames**: UTF-8 JSON control messages and status updates.
   - **Binary Frames**: Raw 16kHz 16-bit Little-Endian mono PCM audio chunks with a 1-byte opcode prefix.
 
-#### 1. Client-to-Daemon JSON Messages:
+### A. Daemon-to-Client JSON Messages
 
+1. **Mode Notification**:
+   Informs client of mode switch governed by the daemon:
 ```json
-// Push-to-Talk Controls
-{"type": "RECORD_START", "mode": "wireless_mic" | "full_phone_io"}
+{
+  "type": "MODE_CHANGE",
+  "mode": "remote" | "compute"
+}
+```
+
+2. **Client Enable / Disable Status**:
+   Informs client whether daemon has turned client on or off via socket command:
+```json
+{
+  "type": "CLIENT_STATUS",
+  "enabled": true
+}
+```
+
+3. **Status Synchronization**:
+```json
+{
+  "type": "STATUS_UPDATE",
+  "state": "idle" | "recording" | "transcribing" | "typing" | "speaking"
+}
+```
+
+4. **Transcribed Text Events**:
+```json
+{
+  "type": "PARTIAL_TEXT",
+  "text": "in-flight recognition..."
+}
+```
+```json
+{
+  "type": "COMMITTED_TEXT",
+  "text": "delivered sentence."
+}
+```
+
+5. **Text-to-Speech Prompt (Remote Mode)**:
+   Daemon pushes text to client for client-side TTS playback:
+```json
+{
+  "type": "TTS_PROMPT",
+  "text": "Task finished successfully.",
+  "voice": "Alba"
+}
+```
+
+6. **Error Event**:
+```json
+{
+  "type": "ERROR",
+  "message": "Client is currently disabled by daemon"
+}
+```
+
+---
+
+### B. Client-to-Daemon JSON Messages
+
+1. **Push-to-Talk & Lock Recording Controls**:
+```json
+{"type": "RECORD_START"}
 {"type": "RECORD_STOP"}
 {"type": "RECORD_CANCEL"}
+```
 
-// Direct Keystroke Injections (routed automatically by daemon)
+2. **Direct Keystroke Injections (Daemon Routes to Active Target)**:
+```json
 {"type": "KEY_PRESS", "key": "Enter" | "Escape" | "Ctrl+C" | "Alt+M"}
+```
 
-// Direct Text Injection (Used in Mode 3 when phone computes STT)
+3. **Direct Text Delivery (Remote & Compute Modes)**:
+   Transcribed speech text delivered to daemon for injection into active tmux pane / Wayland window:
+```json
 {"type": "DELIVER_TEXT", "text": "transcribed text from phone"}
+```
 
-// Text-to-Speech Requests
-{"type": "TTS_SPEAK", "text": "Hello world", "voice": "Alba", "volume": 1.0}
+4. **Text-to-Speech Control**:
+```json
+{"type": "TTS_SPEAK", "text": "Hello world", "voice": "Alba", "volume": 100}
 {"type": "TTS_STOP"}
 {"type": "TTS_CLEAR_AND_STOP"}
 ```
 
-#### 2. Daemon-to-Client JSON Messages:
+---
 
-```json
-// Status Synchronizations
-{"type": "STATUS_UPDATE", "state": "idle" | "recording" | "transcribing" | "typing" | "speaking"}
-{"type": "PARTIAL_TEXT", "text": "in-flight recognition..."}
-{"type": "COMMITTED_TEXT", "text": "delivered sentence."}
-{"type": "ERROR", "message": "error description"}
-```
-
-#### 3. Binary Stream Protocol:
+### C. Binary Stream Protocol
 
 - **Upstream Mic Audio (Client -> Daemon)**:
   - Header byte: `0x02`
-  - Payload: Raw 16kHz mono signed 16-bit PCM chunks (e.g. 512–2048 samples per frame).
-  - Used in **Mode 1 (Wireless Mic)** and **Mode 2 (Full Phone I/O - Daemon Compute)**.
+  - Payload: Raw 16kHz mono signed 16-bit PCM frames.
+  - Used when audio streaming to daemon is active.
 - **Downstream Speaker Audio (Daemon -> Client)**:
   - Header byte: `0x01`
-  - Payload: Raw synthesized Phonon TTS audio chunks.
-  - Used in **Mode 2 (Full Phone I/O - Daemon Compute)** to route daemon voice directly into phone headphones.
+  - Payload: Raw synthesized 24kHz/16kHz PCM audio chunks.

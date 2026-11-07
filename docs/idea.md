@@ -1,93 +1,121 @@
-# Voicy Remote Architecture, Modes & Implementation Roadmap
+# Voicy Remote Architecture, Modes & Specification
 
-High-density technical specification for multi-device voice dictation, speech synthesis, and remote control between the Android client and the headless `voicyd` daemon.
-
----
-
-## 1. The Four Operational Modes
-
-### Mode 1: Wireless Mic Mode (Daemon Compute, Desktop Output)
-- **Audio Capture**: Android device microphone / connected Bluetooth headset.
-- **Audio Output**: Daemon host system speakers.
-- **Compute**: Voicy Daemon host processes raw audio via speech-to-text model.
-- **Transport**: 16kHz mono 16-bit PCM chunks streamed over WebSocket (`0x02` binary frames).
-- **Execution Target**: Text injected directly into locked tmux pane or active Wayland window via `wtype` by daemon.
-- **Resource Footprint**: Minimal mobile CPU and battery footprint; best for light phone overhead while dictating around the room.
-
-### Mode 2: Full Phone I/O (Daemon Compute, Phone Audio)
-- **Audio Capture**: Android device microphone.
-- **Audio Output**: Android device speaker / connected Bluetooth headset.
-- **Compute**: Voicy Daemon processes both speech-to-text and text-to-speech.
-- **Transport**: 
-  - Upstream: Phone streams mic PCM audio to Daemon over WebSocket (`0x02` binary frames).
-  - Downstream: Daemon streams synthesized TTS PCM audio back to Phone over WebSocket (`0x01` binary frames).
-- **Execution Target**: Daemon types text to active target and returns synthesized voice directly to user's pocket/ears.
-
-### Mode 3: Full Phone I/O (Phone Compute, Autonomous Audio)
-- **Audio Capture**: Android device microphone.
-- **Audio Output**: Android device speaker / Bluetooth headset.
-- **Compute**: Android device executes on-device Sherpa-ONNX STT and Phonon TTS models locally in background.
-- **Transport**: Pure text JSON packets exchanged over WebSocket (`DELIVER_TEXT` to Daemon, `TTS_PROMPT` to Phone).
-- **Execution Target**: Voicy Daemon receives finalized text and types it into active target. Zero audio bandwidth across Wi-Fi.
-
-### Mode 4: Wireless API Mode (Phone Compute Engine)
-- **Compute Role**: Android device functions as an autonomous remote compute engine for the Voicy Daemon.
-- **Background Execution**: Runs inside an Android Foreground Service with CPU and Wi-Fi wake-locks.
-- **Workload**: Daemon offloads heavy STT and TTS batch tasks to the phone's NPU/CPU to conserve desktop resources.
-- **Transport**: Daemon streams raw audio / text requests to phone; phone returns transcribed text / synthesized audio chunks.
+High-density technical specification for multi-device voice dictation, speech synthesis, and remote control between the mobile client and the headless `voicyd` daemon.
 
 ---
 
-## 2. Remote Virtual Keys & Discard Protocol
+## 1. The Two Operational Modes
 
-- **Key Injections (Port 9099)**:
-  - `Enter`: Injects carriage return into target pane/window.
-  - `Escape`: Aborts vi mode command or cancels editor selection.
-  - `Ctrl+C`: Halts active running terminal process or agent generation.
-  - `Alt+M`: Toggles daemon mic or custom application key binding.
-- **Immediate Discard Guarantee**:
-  - `RECORD_CANCEL`: Drops recorded audio buffer instantly without transcribing, typing, or outputting text.
+Rather than complex multi-role splits, the system operates in two distinct modes. **Mode switching is strictly controlled by the daemon**; the client does not dictate its mode, but adapts dynamically based on daemon state.
+
+```
++-----------------------------------------------------------------------------+
+|                               VOICY DAEMON                                  |
+|   (Centrally controls mode switching & owns active target routing)          |
++-----------------------------------------------------------------------------+
+               ▲                                            ▲
+               │                                            │
+               │ [Mode Notification]                        │ [Mode Notification]
+               ▼                                            ▼
++-----------------------------+              +--------------------------------+
+|     1. COMPUTE MODE         |              |       2. REMOTE MODE           |
+|                             |              |                                |
+| - Phone acts as compute     |              | - Phone acts as remote I/O     |
+|   engine (on-device models) |              | - Speech-to-text / text-to-    |
+| - Runs STT & TTS workloads  |              |   speech interface             |
+| - Offloads daemon hardware  |              | - Local arithmetic VAD         |
+| - Communicates via text &   |              | - Text-only communication with |
+|   compute payloads          |              |   daemon for target routing    |
++-----------------------------+              +--------------------------------+
+```
+
+### Mode 1: Compute Mode (Phone as Compute Engine)
+- **Role**: The mobile device operates as an auxiliary on-device compute engine.
+- **Workload**: Executes on-device neural/distilled speech models (Sherpa-ONNX STT and Phonon TTS) on the mobile CPU/NPU, freeing desktop resources.
+- **Communication**: Daemon delegates speech tasks to the phone; phone delivers transcribed text or synthesized audio back to the daemon.
+- **Daemon Control**: Daemon switches client into Compute Mode when offloading is desired or configured.
+
+### Mode 2: Remote Mode (Phone as Remote I/O)
+- **Role**: The mobile device acts as a handheld wireless microphone, speaker, and remote terminal key bar.
+- **VAD Processing**: Implements the identical **arithmetic VAD** (RMS frame accumulation and silence counting) as the daemon directly on the phone, preventing unnecessary silence transmission.
+- **Communication**: Communication with the daemon is **always in text** (either transcribed text from STT delivered to the daemon, or text sent from daemon to the client for TTS playback).
+- **Target Routing**: The daemon maintains absolute ownership of `active_target` (tmux pane `%<id>` or Wayland `wtype`). The client delivers text without target selection logic.
 
 ---
 
-## 3. Zero-Config LAN Discovery & Networking
+## 2. Daemon Ownership & Unix Socket Client Control
 
-1. **UDP Broadcast Auto-Discovery (Port 9098)**:
-   - Mobile sends `{"cmd": "VOICY_DISCOVER"}` to `255.255.255.255:9098`.
-   - Daemon replies with unicast JSON: `{"cmd": "VOICY_BEACON", "port": 9099, "hostname": "<name>"}`.
-   - Client automatically initiates WebSocket handshake.
-2. **Manual Override**:
-   - Permanent IP:Port input in UI settings for subnets or routers blocking UDP broadcasts.
+The daemon is the single source of truth for client activation and operational mode:
+- **Unix Domain Socket Commands**:
+  - `CLIENT:ON`: Enables client interaction and instructs daemon to accept client input.
+  - `CLIENT:OFF`: Disables client interaction and disconnects/ignores client inputs.
+  - `MODE:COMPUTE`: Switches active operational mode to Compute Mode.
+  - `MODE:REMOTE`: Switches active operational mode to Remote Mode.
+  - `CLIENT:STATUS`: Returns current client connection status and active mode.
 
----
-
-## 4. Security Considerations & Threat Model
-
-1. **Unauthenticated Local Network Access**:
-   - *Risk*: Anyone connected to the same LAN or guest Wi-Fi could connect to port `9099` and inject arbitrary keystrokes (`Ctrl+C`, `Enter`, text) into the active terminal session.
-   - *Mitigation Plan*:
-     - Phase 1: Local subnet binding + Pre-Shared Key (PSK) or pairing PIN token exchanged during initial handshake.
-     - Phase 2: TLS encryption over WebSocket (`wss://`) with self-signed certificate pinned on mobile client to prevent packet snooping of voice streams.
-2. **Denial of Service (DoS) via Audio Flooding**:
-   - *Risk*: Malicious LAN devices flooding the audio port could exhaust desktop memory or thread pool.
-   - *Mitigation Plan*: Maximum connection concurrency limit (1 active client) and strict payload size checks on PCM frames.
-3. **Android Keystore & Permission Scoping**:
-   - Store pairing credentials in Android EncryptedSharedPreferences / Keystore.
-   - Restrict background microphone recording permissions strictly behind active foreground service notification.
+The client receives WebSocket notifications when the daemon toggles its enabled status or switches modes, updating its UI state accordingly.
 
 ---
 
-## 5. Implementation Roadmap for Tomorrow
+## 3. Network Configuration: Direct IP & Port Settings
 
-- [ ] **Step 1: Voicy Daemon Network Bridge**:
-  - Add WebSocket listener on port `9099` using `tokio-tungstenite` in `voicyd`.
-  - Add UDP auto-discovery responder on port `9098`.
-  - Route incoming network control packets (`KEY_PRESS`, `RECORD_START`, `RECORD_STOP`, `RECORD_CANCEL`) into `voicyd` internal channel.
-- [ ] **Step 2: Client WebSocket Audio Streaming**:
-  - Implement browser `AudioContext` 16kHz PCM stream in `src/App.tsx`.
-  - Connect WebSocket client to daemon IP for real-time dictation and remote key presses.
-- [ ] **Step 3: Android Mobile Wrapper & Foreground Service**:
-  - Scaffold Capacitor / Tauri Mobile Android wrapper.
-  - Implement Android Foreground Service notification, `PARTIAL_WAKE_LOCK`, and `WIFI_MODE_FULL_HIGH_PERF`.
-- [ ] **Step 4: On-Device Compute Integration**:
-  - Integrate Sherpa-ONNX WebAssembly / native Android bindings for Mode 3 and Mode 4 execution.
+- **No UDP Discovery**: UDP auto-discovery broadcasting is disabled in favor of clean, direct network setup.
+- **Settings Screen**: The client provides a dedicated Settings panel in the UI where the user manually enters:
+  - **Daemon Host / IP**: (e.g. `192.168.1.100` or tailscale IP)
+  - **Daemon Port**: (defaults to `9099`)
+- Settings are persisted in local client storage and automatically loaded on startup.
+
+---
+
+## 4. Mobile UI & Mic Gesture Architecture
+
+```
++-----------------------------------------------------------+
+|                      VOICY CLIENT                         |
+|                                                           |
+|                 [Status & Mode Indicator]                 |
+|             "Remote Mode: Connected to 192.168.1.50"       |
+|                                                           |
+|             +-------------------------------+             |
+|             |                               |             |
+|             |     Live Text / Dictation     |             |
+|             |          Display Area         |             |
+|             |                               |             |
+|             +-------------------------------+             |
+|                                                           |
+|                          [ ^ ]                            |
+|                       (Lock Zone)                         |
+|                                                           |
+|                         (( O ))                           |
+|                      [MIC BUTTON]                         |
+|             (Bottom Center, above buttons)                |
+|                                                           |
+|     +-----------+   +-----------+   +-----------+         |
+|     |   Enter   |   |    Esc    |   |  Ctrl+C   |         |
+|     +-----------+   +-----------+   +-----------+         |
++-----------------------------------------------------------+
+```
+
+### Mic Button Placement & Gestures
+1. **Positioning**: Centered at the bottom of the screen, situated directly above the action key buttons (`Enter`, `Esc`, `Ctrl+C`, `Alt+M`).
+2. **Push-to-Talk (Hold)**:
+   - Touch down on Mic: Starts audio capture and streaming.
+   - Touch release: Stops audio capture, finalizes transcription, commits text.
+3. **Swipe-Up Lock (Continuous Listening)**:
+   - While pressing the mic button, swiping upward into the lock area toggles continuous listening mode ("locked on").
+   - The user can lift their finger; the microphone remains active.
+   - Tapping the mic button again or tapping Discard unlocks and stops recording.
+4. **Discard Action**:
+   - Swiping or pressing Discard triggers `RECORD_CANCEL`, immediately dropping the current audio buffer with zero typing or transcription.
+
+---
+
+## 5. Arithmetic VAD Specification (Remote Mode)
+
+To ensure consistency with the daemon's arithmetic VAD:
+- **Frame Size**: 30 milliseconds (480 samples @ 16kHz mono 16-bit PCM).
+- **RMS Energy Calculation**:
+  $$\text{RMS} = \sqrt{\frac{1}{N} \sum_{i=1}^N s_i^2}$$
+- **Speech Threshold**: Frames with RMS exceeding `silence_threshold` (default `0.015`) are classified as speech.
+- **Hangover Silence**: Requires 20 consecutive silent frames (~600ms) before declaring end-of-speech chunk, preventing mid-sentence clipping.
+- **Max Chunk Limit**: 24 seconds continuous speech buffer ceiling to prevent memory starvation before flushing to transcription.

@@ -1,197 +1,166 @@
 # Implementation Design & Engineering Decisions
 
-High-density technical architecture, code design patterns, and engineering rationale for every item in `todo.md`.
+High-density technical architecture, code design patterns, and engineering rationale for the simplified two-mode Voicy system.
 
 ---
 
-## 1. [P0] WebSocket Server on Port 9099 (`voicyd`)
-- **What it does**: Binds an async TCP WebSocket listener on `0.0.0.0:9099` to accept JSON control messages and binary PCM streams from remote clients.
-- **Design in Code**:
-  ```rust
-  // tokio::spawn running alongside main sync worker via std::sync::mpsc crossbeam bridge
-  let listener = TcpListener::bind("0.0.0.0:9099").await?;
-  while let Ok((stream, _)) = listener.accept().await {
-      let ws_stream = tokio_tungstenite::accept_async(stream).await?;
-      let (mut ws_tx, mut ws_rx) = ws_stream.split();
-      // Forward JSON commands to existing daemon internal channel tx_worker
-      // Stream binary PCM (0x02) into an atomic AudioSource ringbuffer
-  }
-  ```
-- **Rationale**: Reuses `voicyd`'s existing internal worker pipeline without rewriting the synchronous Whisper and audio capture threads. WebSocket avoids HTTP polling overhead and natively handles mixed UTF-8 JSON controls with binary audio frames over a single multiplexed TCP connection.
+## 1. The Two-Mode Operational Architecture
+
+### Design & Rationale
+The previous 4-mode layout introduced unnecessary complexity and ambiguity regarding network roles. The revised architecture streamlines operations into two distinct modes:
+
+1. **Compute Mode (Phone as Compute Engine)**:
+   - Phone runs on-device models (Sherpa-ONNX STT and Phonon TTS).
+   - Offloads compute workloads from the host machine to the phone hardware.
+2. **Remote Mode (Phone as Remote I/O)**:
+   - Phone serves as handheld mic, speaker, and action button bar.
+   - Audio is filtered through client-side **arithmetic VAD** matching the daemon.
+   - Exchanges data with the daemon **strictly in text** (`DELIVER_TEXT` for STT delivery, `TTS_PROMPT` for TTS synthesis).
+
+### Mode Switching Authority
+**The daemon is the absolute authority for mode switching.** The client never chooses its mode unilaterally; the daemon sends a `MODE_CHANGE` WebSocket frame (`remote` or `compute`) whenever the active profile changes.
 
 ---
 
-## 2. [P0] UDP Beacon Discovery on Port 9098
-- **What it does**: Listens on broadcast UDP socket `0.0.0.0:9098` for discovery ping and returns daemon host info and WebSocket port.
-- **Design in Code**:
-  ```rust
-  let socket = UdpSocket::bind("0.0.0.0:9098")?;
-  socket.set_broadcast(true)?;
-  let mut buf = [0u8; 256];
-  loop {
-      let (len, src) = socket.recv_from(&mut buf)?;
-      if let Ok(msg) = serde_json::from_slice::<DiscoverQuery>(&buf[..len]) {
-          if msg.cmd == "VOICY_DISCOVER" {
-              let beacon = json!({"cmd": "VOICY_BEACON", "port": 9099, "hostname": get_hostname(), "target": *target.lock().unwrap()});
-              socket.send_to(beacon.to_string().as_bytes(), src)?;
-          }
-      }
-  }
-  ```
-- **Rationale**: Eliminates entering LAN IP addresses manually every time router DHCP assigns a new local IP. UDP broadcast is zero-overhead and instant (<5ms response).
+## 2. Daemon Ownership & Unix Socket Client Controls
 
----
-
-## 3. [P0] Remote Keypress Dispatch (`Enter`, `Escape`, `Ctrl+C`, `Alt+M`)
-- **What it does**: Dispatches virtual keystrokes received over WebSocket directly using the daemon's active target (tmux pane or Wayland window via `wtype`).
-- **Design in Code**:
-  ```rust
-  pub fn send_remote_key(key: &str, target: Option<&str>) {
-      match target {
-          Some(t) if t.starts_with('%') => {
-              // Direct tmux target pane execution
-              let tmux_key = match key {
-                  "Enter" => "Enter",
-                  "Escape" => "Escape",
-                  "Ctrl+C" => "C-c",
-                  "Alt+M" => "M-m",
-                  _ => return,
-              };
-              let _ = Command::new("tmux").args(["send-keys", "-t", t, tmux_key]).status();
-          }
-          _ => {
-              // Focused window execution under Wayland
-              let wtype_arg = match key {
-                  "Enter" => vec!["-k", "Return"],
-                  "Escape" => vec!["-k", "Escape"],
-                  "Ctrl+C" => vec!["-M", "ctrl", "-k", "c", "-m", "ctrl"],
-                  "Alt+M" => vec!["-M", "alt", "-k", "m", "-m", "alt"],
-                  _ => return,
-              };
-              let _ = Command::new("wtype").args(&wtype_arg).status();
-          }
-      }
-  }
-  ```
-- **Rationale**: Decouples terminal interaction from speech. Allows interrupting long-running LLM generation (`Ctrl+C`), submitting prompts (`Enter`), and exiting prompts (`Escape`) directly from the phone without touching the computer keyboard.
-
----
-
-## 4. [P0] Mobile Mic Audio Stream (`src/App.tsx` & Tauri Bridge)
-- **What it does**: Captures 16kHz mono 16-bit PCM audio from the microphone and streams binary frames over the WebSocket during active recording.
-- **Design in Code**:
-  ```typescript
-  // Tauri Rust command or Web Audio AudioWorklet:
-  const audioCtx = new AudioContext({ sampleRate: 16000 });
-  const source = audioCtx.createMediaStreamSource(micStream);
-  const processor = audioCtx.createScriptProcessor(1024, 1, 1);
-  processor.onaudioprocess = (e) => {
-    if (!isRecording.current) return;
-    const inputData = e.inputBuffer.getChannelData(0);
-    // Convert Float32 to Int16 Little-Endian
-    const pcm16 = new Int16Array(inputData.length);
-    for (let i = 0; i < inputData.length; i++) {
-      pcm16[i] = Math.max(-1, Math.min(1, inputData[i])) * 0x7fff;
+### Daemon Unix Socket Commands
+In `src/ipc.rs` and `src/main.rs` of the daemon:
+```rust
+match command {
+    "CLIENT:ON" => {
+        client_enabled.store(true, Ordering::SeqCst);
+        broadcast_client_status(true);
+        "client_enabled\n"
     }
-    const frame = new Uint8Array(1 + pcm16.buffer.byteLength);
-    frame[0] = 0x02; // Upstream mic opcode
-    frame.set(new Uint8Array(pcm16.buffer), 1);
-    ws.send(frame);
-  };
-  ```
-- **Rationale**: Streaming uncompressed 16kHz PCM avoids encoding latency and CPU strain from Opus/AAC compression on mobile, consuming only 32 kB/s on the local LAN while keeping Whisper acoustic fidelity identical to the local microphone.
-
----
-
-## 5. [P0] Immediate Discard Button (`RECORD_CANCEL`)
-- **What it does**: Instantly resets client recording state and sends `RECORD_CANCEL` to daemon to discard buffered audio chunks and suppress typing.
-- **Design in Code**:
-  ```typescript
-  const cancelRecording = () => {
-    if (!isRecording) return;
-    setIsRecording(false);
-    ws.send(JSON.stringify({ type: 'RECORD_CANCEL' }));
-    resetVisualizer();
-  };
-  ```
-  ```rust
-  // Daemon handling:
-  "RECORD_CANCEL" => {
-      recorder.cancel(); // Clears raw sample buffer
-      let current_tid = task_counter.load(Ordering::SeqCst);
-      canceled_task_id.store(current_tid, Ordering::SeqCst); // Drops in-flight worker output
-      sink::resume_media();
-  }
-  ```
-- **Rationale**: Prevents erroneous utterances from being transcribed or committed to the active editor. Guarantees that accidental mic taps can be aborted with zero side effects on the desktop.
-
----
-
-## 6. [P1] Reverse Audio Playback (Mode 2 Phone TTS)
-- **What it does**: Receives synthesized Phonon TTS audio chunks from the daemon over WebSocket and plays them through the phone speaker or connected Bluetooth headphones.
-- **Design in Code**:
-  ```typescript
-  ws.onmessage = async (event) => {
-    if (event.data instanceof ArrayBuffer) {
-      const data = new Uint8Array(event.data);
-      if (data[0] === 0x01) { // Downstream TTS opcode
-        const pcm16 = new Int16Array(data.buffer, 1);
-        playPcmBuffer(pcm16, 24000); // 24kHz Phonon sample rate
-      }
+    "CLIENT:OFF" => {
+        client_enabled.store(false, Ordering::SeqCst);
+        broadcast_client_status(false);
+        "client_disabled\n"
     }
-  };
-  ```
-- **Rationale**: Enables fully headless operation where the user wears headphones paired to their mobile phone away from the laptop, hearing both TTS agent feedback and dictating input without needing laptop audio output.
+    "CLIENT:STATUS" => {
+        // Return JSON with enabled, connected, and current mode
+    }
+    "MODE:COMPUTE" => {
+        current_mode.store(Mode::Compute, Ordering::SeqCst);
+        broadcast_mode_change("compute");
+        "mode_set:compute\n"
+    }
+    "MODE:REMOTE" => {
+        current_mode.store(Mode::Remote, Ordering::SeqCst);
+        broadcast_mode_change("remote");
+        "mode_set:remote\n"
+    }
+    // ...
+}
+```
+
+### Engineering Rationale
+Allows local automation (scripts, shortcuts, or desktop keybindings) to toggle client listening on and off via Unix socket without requiring network hops or client-side toggles.
 
 ---
 
-## 7. [P1] Tauri Android Foreground Service & Wake-Locks
-- **What it does**: Keeps the Android WebView WebSocket connection and audio recording alive when the phone screen turns off or locks in a pocket.
-- **Design in Code**:
-  ```kotlin
-  // Android native foreground service plugin in Tauri:
-  val channelId = "voicy_service_channel"
-  val notification = NotificationCompat.Builder(this, channelId)
-      .setContentTitle("Voicy Remote Active")
-      .setContentText("Connected to voicyd - Headset PTT active")
-      .setSmallIcon(R.drawable.ic_mic)
-      .setOngoing(true)
-      .build()
-  startForeground(1001, notification)
+## 3. Manual Connection Configuration (IP & Port Settings)
 
-  val wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Voicy::RemoteWakeLock")
-  wakeLock.acquire()
-  ```
-- **Rationale**: Android OS aggressively kills background WebSockets and suspends JavaScript execution after 15–30 seconds of screen off. A persistent Foreground Service with `PARTIAL_WAKE_LOCK` is the only guaranteed Android architecture for background headless audio tools.
+### Design
+- **Elimination of UDP Discovery**: UDP broadcasts are unreliable across complex Wi-Fi subnets, mesh routers, and Android battery optimizations.
+- **Settings Screen**:
+  - A clean Settings modal accessible via a gear icon in the header.
+  - Form fields for `daemonHost` (e.g. `192.168.1.50`) and `daemonPort` (default `9099`).
+  - Saved to `localStorage` under `voicy_daemon_host` and `voicy_daemon_port`.
+  - On change or initial mount, attempts WebSocket connection to `ws://${daemonHost}:${daemonPort}/ws`.
 
 ---
 
-## 8. [P2] Local Authentication & Traffic Security (PSK Token)
-- **What it does**: Validates a pre-shared pairing token in the WebSocket opening handshake to reject unauthorized devices on the local Wi-Fi.
-- **Design in Code**:
-  ```rust
-  // On WebSocket upgrade request:
-  let token = req.headers().get("X-Voicy-Token").and_then(|v| v.to_str().ok());
-  if token != Some(&config.network.auth_token) {
-      return reject_handshake(StatusCode::UNAUTHORIZED);
+## 4. Mic Button Layout & Swipe-Up Lock Gesture
+
+### UI Layout
+- The primary microphone button is placed in the **bottom center**, positioned directly above the horizontal bar of action buttons (`Enter`, `Esc`, `Ctrl+C`, `Alt+M`).
+- A visual "Lock" indicator glyph sits directly above the mic button.
+
+```
+       [  Lock  ]  <-- Lights up when dragged into lock zone
+           ^
+         (   )     <-- Bottom-center Mic Button
+  [Enter] [Esc] [Ctrl+C] [Alt+M]  <-- Bottom action bar
+```
+
+### Gesture State Machine
+```
+   [ TOUCH START ]  -->  Start recording (Push-to-Talk)
+          │
+          ├──> [ DRAG UP > 60px ]  -->  Enter LOCKED state (Continuous Listening)
+          │                                  │
+          │                                  └──> [ TOUCH END ] --> Remains recording!
+          │                                                            │
+          │                                                            └──> [ TAP MIC / DISCARD ] --> Stop
+          │
+          └──> [ TOUCH END (without drag) ]  -->  Stop recording & commit (Push-to-Talk)
+```
+
+### Touch Handling Implementation Pattern
+```typescript
+let startY = 0;
+let isDragging = false;
+
+const onTouchStart = (e: React.TouchEvent) => {
+  startY = e.touches[0].clientY;
+  if (!isLocked) {
+    startRecording();
   }
-  ```
-- **Rationale**: Lightweight single-token verification blocks rogue devices on shared Wi-Fi networks (coffee shops, offices) from injecting keystrokes into the host terminal without the complexity of full PKI certificates.
+};
+
+const onTouchMove = (e: React.TouchEvent) => {
+  const currentY = e.touches[0].clientY;
+  const deltaY = startY - currentY;
+  if (deltaY > 60 && !isLocked) {
+    setIsLocked(true); // Locks recording on
+  }
+};
+
+const onTouchEnd = () => {
+  if (!isLocked) {
+    stopRecording();
+  }
+};
+```
 
 ---
 
-## 9. [P3] On-Device Phone Inference Engine (Modes 3 & 4)
-- **What it does**: Executes Sherpa-ONNX STT and Phonon TTS models locally on Android hardware via native Rust bindings inside Tauri.
-- **Design in Code**:
-  ```rust
-  // Inside src-tauri/src/lib.rs:
-  #[tauri::command]
-  fn transcribe_local_pcm(samples: Vec<f32>) -> Result<String, String> {
-      let recognizer = get_sherpa_recognizer()?;
-      let mut stream = recognizer.create_stream()?;
-      stream.accept_waveform(16000, &samples);
-      recognizer.decode_stream(&mut stream);
-      Ok(stream.get_result().text)
-  }
-  ```
-- **Rationale**: Offloads computation from laptop battery when phone has an NPU (e.g. Snapdragon 8 Gen series, Tensor) and enables standalone speech processing with pure text transmission over the network.
+## 5. Client Arithmetic VAD Specification (Remote Mode)
+
+### Rationale
+To prevent streaming gigabytes of silent audio or wasting phone battery, the client implements the exact same arithmetic VAD algorithm utilized by the Rust `voicy` daemon:
+
+1. **Audio Capture**: 16kHz mono 16-bit PCM stream via Web Audio `AudioContext`.
+2. **Frame Slicing**: Audio buffers sliced into 480-sample blocks (30ms per frame).
+3. **RMS Energy Calculation**:
+   $$\text{RMS} = \sqrt{\frac{1}{480} \sum_{i=0}^{479} s_i^2}$$
+4. **Silence & Hangover Rules**:
+   - Frames with `RMS > 0.015` are marked as speech.
+   - Non-speech frames increment a silence counter.
+   - When silence counter reaches `20` consecutive frames (~600ms), speech chunk is finalized.
+   - Hard maximum cap of 24 seconds continuous speech to ensure low latency.
+
+---
+
+## 6. Remote Action Key Grid & Immediate Discard
+
+### Action Key Dispatch
+Action buttons reside beneath the mic button:
+- `Enter`: `KEY_PRESS` with `key: "Enter"`
+- `Escape`: `KEY_PRESS` with `key: "Escape"`
+- `Ctrl+C`: `KEY_PRESS` with `key: "Ctrl+C"`
+- `Alt+M`: `KEY_PRESS` with `key: "Alt+M"`
+
+The daemon inspects `active_target`:
+- If `Some(target)` starts with `%`, executes `tmux send-keys -t <target> <key>`.
+- If `None`, executes `wtype` to emit the keycode to the focused Wayland window.
+- The client has zero knowledge of pane IDs or window targets.
+
+### Discard Guarantee
+Swiping to discard or pressing the cancel button sends:
+```json
+{"type": "RECORD_CANCEL"}
+```
+The daemon drops the recording buffer immediately with zero typing, ensuring instant cancellation.
