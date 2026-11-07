@@ -18,9 +18,9 @@ Prioritized implementation tasks for Voicy Daemon network layer and Tauri Androi
 
 ## Todo List
 
-- [ ] **[P0]** Add WebSocket server on port `9099` to `voicyd` daemon
-- [ ] **[P0]** Add UDP beacon discovery listener on port `9098`
-- [ ] **[P0]** Implement remote keypress dispatch (`Enter`, `Escape`, `Ctrl+C`, `Alt+M`) using daemon active routing target
+- [x] **[P0]** Add WebSocket server on port `9099` to `voicyd` daemon
+- [x] **[P0]** Add UDP beacon discovery listener on port `9098`
+- [x] **[P0]** Implement remote keypress dispatch (`Enter`, `Escape`, `Ctrl+C`, `Alt+M`) using daemon active routing target
 - [ ] **[P0]** Wire mobile mic stream to WebSocket in `src/App.tsx` / Tauri bridge
 - [ ] **[P0]** Connect client discard button to `RECORD_CANCEL`
 - [ ] **[P1]** Add reverse audio playback for Mode 2 TTS on phone
